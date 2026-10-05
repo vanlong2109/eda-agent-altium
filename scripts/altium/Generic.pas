@@ -8345,6 +8345,170 @@ Begin
 End;
 
 {..............................................................................}
+{ TryLoadDbLibComponent - one LoadComponentFromDatabaseLibrary attempt.         }
+{ The SDK documents the signature but not the spelling of the library name or   }
+{ of ADatabaseKeys, so the caller tries several forms; a raise counts as Nil.   }
+{..............................................................................}
+
+Function TryLoadDbLibComponent(LibName, TableName, Keys : String) : ISch_Component;
+Begin
+    Result := Nil;
+    If (LibName = '') Or (Keys = '') Then Exit;
+    Try
+        Result := SchServer.LoadComponentFromDatabaseLibrary(LibName, TableName, Keys);
+    Except
+        Result := Nil;
+    End;
+End;
+
+{..............................................................................}
+{ Gen_PlaceDbLibComponents - Bulk placement from a database library (.DbLib).   }
+{ Each op: dblib_path, table, key_field, key_value, x, y, rotation, designator, }
+{ part_id (default 1), and optionally keys (a raw ADatabaseKeys string tried   }
+{ before the built ones).                                                       }
+{ A part placed this way carries the DbLib link (table + key), so its           }
+{ footprint, parameters and Update Parameters From Database all come from the   }
+{ database record, exactly as the Components panel would place it.             }
+{ The response reports, per placed op, which library / key form loaded it.      }
+{..............................................................................}
+
+Function Gen_PlaceDbLibComponents(Params : String; RequestId : String) : String;
+Var
+    PlaceStr, Op, Remaining, FailedRefdes, Forms, ResponseBody : String;
+    OpCount, Placed, Failed, Rotation, OrientationVal, LibIdx, KeyIdx, PartId : Integer;
+    DbLibPath, TableName, KeyField, KeyValue, RawKeys, Desig : String;
+    LibName, Keys, UsedForm : String;
+    X, Y : Integer;
+    SchDoc : ISch_Document;
+    Comp : ISch_Component;
+Begin
+    PlaceStr := ExtractJsonValue(Params, 'placements');
+    If PlaceStr = '' Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'MISSING_PARAM', 'placements is required');
+        Exit;
+    End;
+
+    SchDoc := SchServer.GetCurrentSchDocument;
+    If SchDoc = Nil Then
+    Begin
+        Result := BuildErrorResponse(RequestId, 'NO_SCHEMATIC', 'No schematic document is active');
+        Exit;
+    End;
+
+    Placed := 0;
+    Failed := 0;
+    OpCount := 0;
+    Remaining := PlaceStr;
+    FailedRefdes := '';
+    Forms := '';
+
+    SchServer.ProcessControl.PreProcess(SchDoc, '');
+    Try
+        While True Do
+        Begin
+            Op := NextBatchOp(Remaining);
+            If Op = '' Then Break;
+            OpCount := OpCount + 1;
+            DbLibPath := GetBatchField(Op, 'dblib_path');
+            TableName := GetBatchField(Op, 'table');
+            KeyField := GetBatchField(Op, 'key_field');
+            KeyValue := GetBatchField(Op, 'key_value');
+            RawKeys := GetBatchField(Op, 'keys');
+            Desig := GetBatchField(Op, 'designator');
+            X := StrToIntDef(GetBatchField(Op, 'x'), 0);
+            Y := StrToIntDef(GetBatchField(Op, 'y'), 0);
+            Rotation := StrToIntDef(GetBatchField(Op, 'rotation'), 0);
+            PartId := StrToIntDef(GetBatchField(Op, 'part_id'), 1);
+
+            If (DbLibPath = '') Or (TableName = '') Or
+               ((KeyValue = '') And (RawKeys = '')) Then
+            Begin
+                Inc(Failed);
+                If FailedRefdes <> '' Then FailedRefdes := FailedRefdes + ',';
+                FailedRefdes := FailedRefdes + Desig + ':MISSING_FIELD';
+                Continue;
+            End;
+
+            { Library as given (full path), then bare file name. Keys: the  }
+            { raw string if supplied, then value alone, Field=Value,        }
+            { [Field]=Value and a quoted where-clause form.                  }
+            Comp := Nil;
+            UsedForm := '';
+            For LibIdx := 0 To 1 Do
+            Begin
+                If Comp <> Nil Then Break;
+                If LibIdx = 0 Then LibName := DbLibPath
+                Else LibName := ExtractFileName(DbLibPath);
+                For KeyIdx := 0 To 4 Do
+                Begin
+                    If Comp <> Nil Then Break;
+                    Keys := '';
+                    If KeyIdx = 0 Then Keys := RawKeys
+                    Else If KeyValue <> '' Then
+                    Begin
+                        If KeyIdx = 1 Then Keys := KeyValue
+                        Else If KeyField <> '' Then
+                        Begin
+                            If KeyIdx = 2 Then Keys := KeyField + '=' + KeyValue
+                            Else If KeyIdx = 3 Then Keys := '[' + KeyField + ']=' + KeyValue
+                            Else Keys := '[' + KeyField + '] = ''' + KeyValue + '''';
+                        End;
+                    End;
+                    Comp := TryLoadDbLibComponent(LibName, TableName, Keys);
+                    If Comp <> Nil Then
+                        UsedForm := 'lib' + IntToStr(LibIdx) + '/key' + IntToStr(KeyIdx);
+                End;
+            End;
+
+            If Comp = Nil Then
+            Begin
+                Inc(Failed);
+                If FailedRefdes <> '' Then FailedRefdes := FailedRefdes + ',';
+                FailedRefdes := FailedRefdes + Desig + ':LOAD_FAILED';
+                Continue;
+            End;
+
+            { The loaded part shows whichever sub-part the symbol was saved  }
+            { on (measured: part B of a dual op-amp), so set it explicitly. }
+            Try Comp.SetState_CurrentPartID(PartId); Except End;
+            Try Comp.CurrentPartID := PartId; Except End;
+
+            Try SchDoc.AddSchObject(Comp); Except End;
+            Try Comp.MoveToXY(MilsToCoord(X), MilsToCoord(Y)); Except End;
+
+            OrientationVal := 0;
+            If Rotation = 90 Then OrientationVal := 1
+            Else If Rotation = 180 Then OrientationVal := 2
+            Else If Rotation = 270 Then OrientationVal := 3;
+            Try Comp.SetState_Orientation(OrientationVal); Except End;
+
+            If Desig <> '' Then
+                Try Comp.Designator.Text := Desig; Except End;
+
+            SchRegisterObject(SchDoc, Comp);
+            Inc(Placed);
+            If Forms <> '' Then Forms := Forms + ',';
+            Forms := Forms + Desig + ':' + UsedForm;
+        End;
+    Finally
+        SchServer.ProcessControl.PostProcess(SchDoc, 'Edit');
+        SchDoc.GraphicallyInvalidate;
+    End;
+
+    ResponseBody := '{"placed":' + IntToStr(Placed)
+        + ',"failed":' + IntToStr(Failed)
+        + ',"total":' + IntToStr(OpCount)
+        + ',"load_forms":"' + EscapeJsonString(Forms) + '"';
+    If FailedRefdes <> '' Then
+        ResponseBody := ResponseBody + ',"failed_refdes":"'
+            + EscapeJsonString(FailedRefdes) + '"';
+    ResponseBody := ResponseBody + '}';
+    If SchDoc <> Nil Then MarkDocDirtyByPath(SchDoc.DocumentName);
+    Result := BuildSuccessResponse(RequestId, ResponseBody);
+End;
+
+{..............................................................................}
 { Gen_PlaceNetLabels - Bulk net-label placement on the active schematic.        }
 { Params: labels = 'text=VCC;x=100;y=200;orientation=0~~text=GND;x=...'         }
 { One PreProcess/PostProcess wraps the whole batch; cuts ~1s/label of overhead. }
@@ -11293,6 +11457,7 @@ Begin
         'set_sch_components_parameters': Result := Gen_SetSchComponentsParameters(Params, RequestId);
         'set_sch_text_positions':      Result := Gen_SetSchTextPositions(Params, RequestId);
         'place_sch_components_from_library': Result := Gen_PlaceSchComponentsFromLibrary(Params, RequestId);
+        'place_dblib_components':     Result := Gen_PlaceDbLibComponents(Params, RequestId);
         'attach_spice_primitives':    Result := Gen_AttachSpicePrimitivesBatch(Params, RequestId);
     Else
         Result := BuildErrorResponse(RequestId, 'UNKNOWN_ACTION', 'Unknown generic action: ' + Action);

@@ -43,6 +43,21 @@ PLACEMENT_KEYS = frozenset({
 })
 
 
+#: Every key ``sch_place_dblib_components`` reads from a placement dict.
+DBLIB_PLACEMENT_KEYS = frozenset({
+    "dblib_path",
+    "table",
+    "part_number",
+    "key_field",
+    "keys",
+    "x",
+    "y",
+    "rotation",
+    "designator",
+    "part_id",
+})
+
+
 def unknown_placement_keys(
     placements: list[dict[str, Any]],
 ) -> dict[str, Optional[str]]:
@@ -2767,6 +2782,125 @@ def register_generic_tools(mcp):
                 }
         return await bridge.send_command_async(
             "generic.place_sch_components_from_library",
+            {"placements": "~~".join(op_strs)},
+        )
+
+    @mcp.tool()
+    async def sch_place_dblib_components(
+        placements: list[dict[str, Any]],
+        dblib_path: Optional[str] = None,
+        document_path: Optional[str] = None,
+        allow_manual_layout: bool = False,
+    ) -> dict[str, Any]:
+        """Place components from a DATABASE library (.DbLib) in ONE call.
+
+        The DbLib counterpart of ``sch_place_components``. A part placed
+        here is loaded through ``SchServer.LoadComponentFromDatabaseLibrary``
+        and keeps its database link (table + key), so its footprint, its
+        parameters and Tools > Update Parameters From Database all come
+        from the matched record, exactly as placing it from the Components
+        panel would. ``sch_place_components`` cannot do this: it loads the
+        bare symbol from a SchLib and can attach neither the footprint nor
+        the table name.
+
+        Same manual-layout gate as ``sch_place_components``: four or more
+        parts onto a sheet holding two or fewer is refused unless
+        ``allow_manual_layout=True``.
+
+        Args:
+            placements: List of placement dicts, each with:
+                - table (str, required), DbLib table name, e.g.
+                  "Capacitors - Ceramic - 0603"
+                - part_number (str, required unless ``keys``), value of
+                  the table's key field
+                - key_field (str, optional), key column, default
+                  "Part Number"
+                - x, y (int, mils), placement location
+                - designator (str, optional)
+                - rotation (int, optional), 0 / 90 / 180 / 270
+                - part_id (int, optional), sub-part of a multi-part
+                  device, default 1 (part A). Place part B of the same
+                  device as a second placement with the same designator
+                  and ``part_id: 2``.
+                - dblib_path (str, optional), overrides the top-level one
+                - keys (str, optional), a raw ADatabaseKeys string tried
+                  before the forms built from key_field / part_number
+            dblib_path: Absolute path of the .DbLib, used for every
+                placement that does not name its own.
+            document_path: Absolute .SchDoc path to focus before placing.
+            allow_manual_layout: Bypass the manual-layout refusal.
+
+        Returns:
+            Dict with placed, failed, total, ``load_forms`` (which library
+            and key spelling loaded each part) and ``failed_refdes``.
+        """
+        unknown = sorted(
+            {k for p in placements if isinstance(p, dict) for k in p}
+            - DBLIB_PLACEMENT_KEYS)
+        if unknown:
+            return {
+                "error": "UNKNOWN_PLACEMENT_KEYS",
+                "reason": "placement dicts carry keys this tool does not "
+                          "read: " + ", ".join(repr(k) for k in unknown),
+                "valid_keys": sorted(DBLIB_PLACEMENT_KEYS),
+                "placed": 0,
+                "total": len(placements),
+            }
+
+        op_strs: list[str] = []
+        for p in placements:
+            lib = str(p.get("dblib_path") or dblib_path or "").strip()
+            table = str(p.get("table", "")).strip()
+            part = str(p.get("part_number", "")).strip()
+            keys = str(p.get("keys", "")).strip()
+            if not lib or not table or not (part or keys):
+                return {
+                    "error": "MISSING_FIELD",
+                    "reason": "every placement needs dblib_path (here or "
+                              "top-level), table, and part_number or keys",
+                    "placement": p,
+                    "placed": 0,
+                }
+            fields = [
+                f"dblib_path={payload_safe(lib)}",
+                f"table={payload_safe(table)}",
+                f"key_field={payload_safe(p.get('key_field') or 'Part Number')}",
+                f"key_value={payload_safe(part)}",
+                f"x={int(p.get('x', 0))}",
+                f"y={int(p.get('y', 0))}",
+                f"rotation={int(p.get('rotation', 0))}",
+                f"part_id={int(p.get('part_id', 1))}",
+            ]
+            if keys:
+                fields.append(f"keys={payload_safe(keys)}")
+            if p.get("designator"):
+                fields.append(f"designator={payload_safe(p['designator'])}")
+            op_strs.append(";".join(fields))
+
+        if not op_strs:
+            return {"error": "No valid placements", "placed": 0}
+
+        bridge = get_bridge()
+        refusal = await _refuse_manual_sheet_layout(
+            bridge, len(op_strs), document_path, allow_manual_layout)
+        if refusal is not None:
+            return refusal
+        if document_path:
+            focus = await bridge.send_command_async(
+                "application.set_active_document",
+                {"file_path": document_path},
+            )
+            if isinstance(focus, dict) and not focus.get("success", True):
+                return {
+                    "error": "FOCUS_FAILED",
+                    "reason": f"could not focus {document_path} before "
+                    "placement; aborting to avoid placing on the wrong "
+                    "sheet",
+                    "focus_result": focus,
+                    "placed": 0,
+                }
+        return await bridge.send_command_async(
+            "generic.place_dblib_components",
             {"placements": "~~".join(op_strs)},
         )
 
